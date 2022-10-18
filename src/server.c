@@ -4351,6 +4351,22 @@ void echoCommand(client *c) {
     addReplyBulk(c,c->argv[1]);
 }
 
+void rechoCommand(client *c) {
+    robj *obj = c->argv[1];
+    char *str = obj->ptr;
+    int len = sdslen(obj->ptr);
+    int i;
+    char tmp;
+    
+    for (i = 0 ; i < len/2; i++) {
+        tmp = str[i];  
+        str[i] = str[len - i - 1];  
+        str[len - i - 1] = tmp; 
+    }
+
+    addReplyBulk(c,obj);
+}
+
 void timeCommand(client *c) {
     addReplyArrayLen(c,2);
     addReplyBulkLongLong(c, server.unixtime);
