@@ -89,6 +89,9 @@ void clusterRemoveNodeFromShard(clusterNode *node);
 int auxShardIdSetter(clusterNode *n, void *value, int length);
 sds auxShardIdGetter(clusterNode *n, sds s);
 int auxShardIdPresent(clusterNode *n);
+int auxEngineVersionSetter(clusterNode *n, void *value, int length);
+sds auxEngineVersionGetter(clusterNode *n, sds s);
+int auxEngineVersionPresent(clusterNode *n);
 static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen);
 
 /* Links to the next and previous entries for keys in the same slot are stored
@@ -173,6 +176,7 @@ typedef struct {
 typedef enum {
     af_start,
     af_shard_id = af_start,
+    af_engine_version,
     af_count,
 } auxFieldIndex;
 
@@ -182,6 +186,7 @@ typedef enum {
  * 2. aux name can contain characters that pass the isValidAuxChar check only */
 auxFieldHandler auxFieldHandlers[] = {
     {"shard-id", auxShardIdSetter, auxShardIdGetter, auxShardIdPresent},
+    {"engine-version", auxEngineVersionSetter, auxEngineVersionGetter, auxEngineVersionPresent},
 };
 
 int isValidAuxChar(int c) {
@@ -217,6 +222,22 @@ sds auxShardIdGetter(clusterNode *n, sds s) {
 
 int auxShardIdPresent(clusterNode *n) {
     return strlen(n->shard_id);
+}
+
+int auxEngineVersionSetter(clusterNode *n, void *value, int length) {
+    n->engine_version = sdscpylen(n->engine_version, value, length);
+    if(sdscmp(n->engine_version, value) != 0) {
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+sds auxEngineVersionGetter(clusterNode *n, sds s) {
+    return sdscatprintf(s, "%s", n->engine_version);
+}
+
+int auxEngineVersionPresent(clusterNode *n) {
+    return strlen(n->engine_version);
 }
 
 /* clusterLink send queue blocks */
@@ -430,6 +451,7 @@ int clusterLoadConfig(char *filename) {
             if (!strcasecmp(s,"myself")) {
                 serverAssert(server.cluster->myself == NULL);
                 myself = server.cluster->myself = n;
+                myself->engine_version = sdscpy(myself->engine_version ,REDIS_VERSION);
                 n->flags |= CLUSTER_NODE_MYSELF;
             } else if (!strcasecmp(s,"master")) {
                 n->flags |= CLUSTER_NODE_MASTER;
@@ -830,6 +852,20 @@ static void updateShardId(clusterNode *node, const char *shard_id) {
     }
 }
 
+/* Update the engine version for the specified node with the provided C string. */
+static void updateEngineVersion(clusterNode *node, char *new) {
+    /* Previous and new hostname are the same, no need to update. */
+    if (new && !strcmp(new, node->engine_version)) {
+        return;
+    } 
+
+    if (new) {
+        node->engine_version = sdscpy(node->engine_version, new);
+    } 
+
+    clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+}
+
 /* Update my hostname based on server configuration values */
 void clusterUpdateMyselfHostname(void) {
     if (!myself) return;
@@ -881,6 +917,7 @@ void clusterInit(void) {
             createClusterNode(NULL,CLUSTER_NODE_MYSELF|CLUSTER_NODE_MASTER);
         serverLog(LL_NOTICE,"No cluster configuration found, I'm %.40s",
             myself->name);
+        myself->engine_version = sdscpy(myself->engine_version, REDIS_VERSION);
         clusterAddNode(myself);
         clusterAddNodeToShard(myself->shard_id, myself);
         saveconf = 1;
@@ -1264,6 +1301,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->orphaned_time = 0;
     node->repl_offset_time = 0;
     node->repl_offset = 0;
+    node->engine_version = sdsempty();
     listSetFreeMethod(node->fail_reports,zfree);
     return node;
 }
@@ -1422,6 +1460,7 @@ void freeClusterNode(clusterNode *n) {
     serverAssert(dictDelete(server.cluster->nodes,nodename) == DICT_OK);
     sdsfree(nodename);
     sdsfree(n->hostname);
+    sdsfree(n->engine_version);
 
     /* Release links and associated data structures. */
     if (n->link) freeClusterLink(n->link);
@@ -2328,6 +2367,13 @@ uint32_t getHostnamePingExtSize() {
     return getAlignedPingExtSize(sdslen(myself->hostname) + 1);
 }
 
+uint32_t getEngineVersionPingExtSize() {
+    if (sdslen(myself->engine_version) == 0) {
+        return 0;
+    }
+    return getAlignedPingExtSize(sdslen(myself->engine_version)+ 1);
+}
+
 uint32_t getShardIdPingExtSize() {
     return getAlignedPingExtSize(sizeof(clusterMsgPingExtShardId));
 }
@@ -2408,7 +2454,22 @@ uint32_t writePingExt(clusterMsg *hdr, int gossipcount)  {
     }
     totlen += getShardIdPingExtSize();
     extensions++;
+    
+    /* Populate engine_version */
+    if (sdslen(myself->engine_version) != 0){
+        if (cursor != NULL ) {
+            clusterMsgPingExtEngineVersion *ext = preparePingExt(cursor, CLUSTERMSG_EXT_TYPE_ENGINE_VERSION, getEngineVersionPingExtSize());
+            memcpy(ext->engine_version, myself->engine_version, sdslen(myself->engine_version));
 
+            /* Move the write cursor */
+            cursor = nextPingExt(cursor);
+
+        }
+        totlen += getEngineVersionPingExtSize();
+        extensions++;
+    }
+    
+    
     if (hdr != NULL) {
         if (extensions != 0) {
             hdr->mflags[0] |= CLUSTERMSG_FLAG0_EXT_DATA;
@@ -2425,6 +2486,7 @@ void clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
     clusterNode *sender = link->node ? link->node : clusterLookupNode(hdr->sender, CLUSTER_NAMELEN);
     char *ext_hostname = NULL;
     char *ext_shardid = NULL;
+    char *ext_engine_version = NULL;
     uint16_t extensions = ntohs(hdr->extensions);
     /* Loop through all the extensions and process them */
     clusterMsgPingExt *ext = getInitialPingExt(hdr, ntohs(hdr->count));
@@ -2449,6 +2511,9 @@ void clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
         } else if (type == CLUSTERMSG_EXT_TYPE_SHARDID) {
             clusterMsgPingExtShardId *shardid_ext = (clusterMsgPingExtShardId *) &(ext->ext[0].shard_id);
             ext_shardid = shardid_ext->shard_id;
+        } else if (type == CLUSTERMSG_EXT_TYPE_ENGINE_VERSION) {
+            clusterMsgPingExtEngineVersion *engine_version_ext = (clusterMsgPingExtEngineVersion *) &(ext->ext[0].engine_version);
+            ext_engine_version = engine_version_ext->engine_version;
         } else {
             /* Unknown type, we will ignore it but log what happened. */
             serverLog(LL_WARNING, "Received unknown extension type %d", type);
@@ -2462,6 +2527,7 @@ void clusterProcessPingExtensions(clusterMsg *hdr, clusterLink *link) {
      * set it now. */
     updateAnnouncedHostname(sender, ext_hostname);
     updateShardId(sender, ext_shardid);
+    updateEngineVersion(sender, ext_engine_version);
 }
 
 static clusterNode *getNodeFromLinkAndMsg(clusterLink *link, clusterMsg *hdr) {
@@ -5474,6 +5540,10 @@ void addNodeDetailsToShardReply(client *c, clusterNode *node) {
     addReplyBulkCString(c, health_msg);
     reply_count++;
 
+    addReplyBulkCString(c, "engine-version");
+    addReplyBulkCBuffer(c, node->engine_version, sdslen(node->engine_version));
+    reply_count++;
+
     setDeferredMapLen(c, node_replylen, reply_count);
 }
 
@@ -5528,9 +5598,11 @@ void clusterReplyMultiBulkSlots(client * c) {
      *            3) 1) master IP
      *               2) master port
      *               3) node ID
+     *               4) node engine version
      *            4) 1) replica IP
      *               2) replica port
      *               3) node ID
+     *               4) node engine version
      *           ... continued until done
      */
     clusterNode *n = NULL;

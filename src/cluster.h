@@ -148,6 +148,7 @@ typedef struct clusterNode {
     clusterLink *link;          /* TCP/IP link established toward this node */
     clusterLink *inbound_link;  /* TCP/IP link accepted from this node */
     list *fail_reports;         /* List of nodes signaling this as failing */
+    sds engine_version;         /* The node's engine version */
 } clusterNode;
 
 /* Slot to keys for a single slot. The keys in the same slot are linked together
@@ -262,6 +263,7 @@ typedef enum {
     CLUSTERMSG_EXT_TYPE_HOSTNAME,
     CLUSTERMSG_EXT_TYPE_FORGOTTEN_NODE,
     CLUSTERMSG_EXT_TYPE_SHARDID,
+    CLUSTERMSG_EXT_TYPE_ENGINE_VERSION,
 } clusterMsgPingtypes; 
 
 /* Helper function for making sure extensions are eight byte aligned. */
@@ -270,6 +272,10 @@ typedef enum {
 typedef struct {
     char hostname[1]; /* The announced hostname, ends with \0. */
 } clusterMsgPingExtHostname;
+
+typedef struct {
+    char engine_version[1]; /* The node's engine_version, ends with \0. */
+} clusterMsgPingExtEngineVersion;
 
 typedef struct {
     char name[CLUSTER_NAMELEN]; /* Node name. */
@@ -290,6 +296,7 @@ typedef struct {
         clusterMsgPingExtHostname hostname;
         clusterMsgPingExtForgottenNode forgotten_node;
         clusterMsgPingExtShardId shard_id;
+        clusterMsgPingExtEngineVersion engine_version;
     } ext[]; /* Actual extension information, formatted so that the data is 8 
               * byte aligned, regardless of its content. */
 } clusterMsgPingExt;
